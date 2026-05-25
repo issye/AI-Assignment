@@ -1,0 +1,9 @@
+python>=3.9
+jupyter
+scikit-learn
+pandas
+numpy
+matplotlib
+seaborn
+joblib
+openpyxl
