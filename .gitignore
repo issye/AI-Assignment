@@ -36,3 +36,5 @@ desktop.ini
 *.env
 .env.*
 secrets.py
+~
+.~lock.*
