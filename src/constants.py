@@ -112,8 +112,8 @@ GENDERS = ["Female", "Male", "Other"]
 # Urban cities (Istanbul, Ankara, Izmir) vs regional — used by rules engine.
 # -----------------------------------------------------------------------------
 CITIES = [
-    "Adana", "Ankara", "Antalya", "Bursa", "Gaziantep",
-    "Istanbul", "Izmir", "Kayseri", "Konya", "Mersin",
+    "Adana", "Ankara", "Antalya", "Bursa", "Eskisehir",
+    "Gaziantep", "Istanbul", "Izmir", "Kayseri", "Konya",
 ]
 
 URBAN_CITIES = ["Istanbul", "Ankara", "Izmir"]
