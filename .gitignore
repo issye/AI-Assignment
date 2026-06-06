@@ -32,6 +32,8 @@ desktop.ini
 .vscode/
 .idea/
 
+# Agent handoff docs — tracked so teammates can access briefs via the repo
+
 # Credentials / secrets — never commit these
 *.env
 .env.*
