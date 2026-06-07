@@ -1,4 +1,4 @@
-# Agent Handoff — A* Search Module (Member 1)
+# Agent Handoff — Search Module (Member 1)
 **Project:** CIC6314 Smart Product Recommendation System
 **Branch:** `feature/search`
 **Deadline:** 27 June 2026, 7 PM
@@ -7,220 +7,227 @@
 
 ## What Changed and Why
 
-The project has pivoted to the **suvroo dataset** (Indian market, ₹ currency). Two things affect your module:
+The project has **fully pivoted** from A* category pathfinding to a **BFS-based category
+reachability search + popularity-based cold-start fallback**.
 
-1. **Categories reduced from 8 to 6** — Food and Toys are no longer in the system. Your graph has 6 nodes instead of 8.
-
-2. **Price-gap heuristic is no longer viable** — suvroo category avg prices are nearly flat (all ~₹2,500). A price-based heuristic would produce near-arbitrary paths. Instead, use **co-purchase frequency** as edge costs: how often customers bought from both category A and B in the same purchase session. High co-purchase = low cost = categories are "close."
-
-Everything else stays the same:
-- A* algorithm logic unchanged
-- `find_product_path()` signature unchanged
-- Output format unchanged (list of category strings)
+| What changed | Old (suvroo) | New (Online Retail) |
+|---|---|---|
+| Algorithm | A* pathfinding | BFS on category similarity graph |
+| Edge costs | Co-purchase frequency (synthetic) | Cosine similarity from real CF matrix |
+| Graph nodes | 6 categories | 8 categories |
+| Start node | browsing_history[0] | favourite_category |
+| Output | Category path list | Reachable category shortlist |
+| Cold-start | Not handled | `find_popular_categories()` (new function) |
 
 ---
 
-## Updated Constants (pull from `src/constants.py`)
+## Your Module's New Role
 
-```python
-from src.constants import (
-    PRODUCT_CATEGORIES,    # 6 categories
-    CATEGORY_AVG_PRICES,   # reference only — NOT used for edge costs anymore
-    SPEND_THRESHOLDS,      # ₹ quartile-based tiers
-    CITIES, URBAN_CITIES,  # Indian cities
-    SAMPLE_PROFILES,
-    build_user_profile,
-    get_price_range,
-)
+The search module sits **between the rules engine and the CF model**:
+
+```
+apply_rules()               → eligible: broad set (up to 8 categories)
+        ↓
+find_reachable_categories() → shortlist: categories reachable from user's buying pattern
+        ↓
+predict_product()           → CF scores the shortlist
 ```
 
-### PRODUCT_CATEGORIES (6 nodes in your graph)
-```python
-["Books", "Beauty", "Electronics", "Fashion", "Sports", "Home & Garden"]
-```
+For new users with no purchase history, CF cannot function. You own that path entirely:
 
-### SPEND_THRESHOLDS (updated ₹ values)
 ```
-Low:      Avg_Order_Value < ₹1,636
-Mid-Low:  ₹1,636 – ₹2,740
-Mid-High: ₹2,740 – ₹3,879
-High:     ≥ ₹3,879
+apply_rules()               → eligible: ["Home Decor", "Seasonal & Gifts", "Kitchen & Dining"]
+        ↓
+find_popular_categories()   → ordered by global transaction count
+        ↓
+(CF is bypassed — Member 4 handles routing)
 ```
 
 ---
 
-## New Heuristic: Co-Purchase Frequency
+## Two Functions to Implement
 
-### How to compute the co-purchase matrix
+### Function 1: `find_reachable_categories(user_profile, eligible, max_hops=2) -> list[str]`
 
-From `data/suvroo/customer_data_collection.csv`, parse each customer's `Purchase_History` and map items to categories:
+**For returning users (purchase_history is non-empty).**
 
-```python
-ITEM_TO_CAT = {
-    'Biography': 'Books', 'Non-fiction': 'Books', 'Fiction': 'Books', 'Comics': 'Books',
-    'Moisturizer': 'Beauty', 'Lipstick': 'Beauty', 'Foundation': 'Beauty', 'Perfume': 'Beauty',
-    'Smartphone': 'Electronics', 'Headphones': 'Electronics', 'Laptop': 'Electronics', 'Smartwatch': 'Electronics',
-    'T-shirt': 'Fashion', 'Jeans': 'Fashion', 'Jacket': 'Fashion', 'Shoes': 'Fashion',
-    'Resistance Bands': 'Sports', 'Dumbbells': 'Sports', 'Yoga Mat': 'Sports', 'Treadmill': 'Sports',
-    'Wall Art': 'Home & Garden', 'Curtains': 'Home & Garden', 'Cushions': 'Home & Garden', 'Lamp': 'Home & Garden',
-}
-```
-
-For each customer, find all category pairs in their purchase history. Count how many customers share each pair:
+BFS on the 8×8 category similarity graph starting from `favourite_category`.
+Returns the subset of `eligible` that is reachable within `max_hops` hops above a
+similarity threshold. Ordered by graph proximity (closest categories first).
 
 ```python
-import pandas as pd
-import re
-from itertools import combinations
-from collections import defaultdict
-
-df = pd.read_csv('data/suvroo/customer_data_collection.csv')
-
-co_counts = defaultdict(int)
-
-for _, row in df.iterrows():
-    items = re.findall(r"'([^']+)'", str(row['Purchase_History']))
-    cats = list(set(ITEM_TO_CAT.get(i) for i in items if ITEM_TO_CAT.get(i)))
-    for a, b in combinations(sorted(cats), 2):
-        co_counts[(a, b)] += 1
-
-total_customers = len(df)  # 10,000
-
-# Edge cost: high co-purchase = low cost (categories are "close")
-# Low co-purchase = high cost (categories are "far")
-CO_PURCHASE_COSTS = {
-    (a, b): round(1 - (count / total_customers), 4)
-    for (a, b), count in co_counts.items()
-}
-```
-
-**Hardcode the resulting matrix** — run once, copy the values into your module as a constant. This avoids loading the CSV at inference time.
-
-### Edge cost formula
-```
-cost(A → B) = 1 - (co_purchase_count(A, B) / 10000)
-```
-- Categories bought together by 7,000 customers → cost = 0.30 (very close)
-- Categories bought together by 800 customers → cost = 0.92 (far)
-
-### Heuristic function
-```python
-def heuristic(current_category: str, target_category: str) -> float:
+def find_reachable_categories(
+    user_profile: dict,
+    eligible:     list,
+    max_hops:     int = 2,
+    threshold:    float = 0.40,
+) -> list[str]:
     """
-    Admissible heuristic: co-purchase cost between current and target.
-    Never overestimates true path cost through the graph.
-    """
-    key = tuple(sorted([current_category, target_category]))
-    return CO_PURCHASE_COSTS.get(key, 1.0)  # default 1.0 if pair not found
-```
-
-**Admissibility proof:** The heuristic returns the direct co-purchase cost between two categories. The true shortest path cost through the graph must be ≥ direct edge cost (triangle inequality holds because all edge costs are non-negative). Therefore h(n) never overestimates — the heuristic is admissible.
-
----
-
-## New Start Node Logic
-
-Old: start = category closest to user's median_spend by price.
-New: start = most recently browsed category from user profile.
-
-```python
-def get_start_category(user_profile: dict) -> str:
-    """
-    Determine A* start node from user's browsing history.
-    Falls back to spend-tier default if no browsing data available.
-    """
-    # user_profile may optionally contain browsing_history
-    browsing = user_profile.get('browsing_history', [])
-    if browsing:
-        return browsing[0]  # first browsed category as entry point
-
-    # Fallback: map spend tier to a default starting category
-    tier = user_profile['price_range']
-    tier_defaults = {
-        'Low':      'Books',
-        'Mid-Low':  'Fashion',
-        'Mid-High': 'Sports',
-        'High':     'Electronics',
-    }
-    return tier_defaults.get(tier, 'Books')
-```
-
----
-
-## Updated PRODUCT_GRAPH (6 nodes)
-
-```python
-# Edges connect all 6 categories as a fully connected graph.
-# Edge costs come from CO_PURCHASE_COSTS (hardcoded from suvroo data).
-# Node 'avg_price' kept for reference — not used for routing.
-
-PRODUCT_GRAPH = {
-    "Books":         {"avg_price": 2524, "neighbors": ["Beauty", "Electronics", "Fashion", "Sports", "Home & Garden"]},
-    "Beauty":        {"avg_price": 2501, "neighbors": ["Books", "Electronics", "Fashion", "Sports", "Home & Garden"]},
-    "Electronics":   {"avg_price": 2548, "neighbors": ["Books", "Beauty", "Fashion", "Sports", "Home & Garden"]},
-    "Fashion":       {"avg_price": 2618, "neighbors": ["Books", "Beauty", "Electronics", "Sports", "Home & Garden"]},
-    "Sports":        {"avg_price": 2578, "neighbors": ["Books", "Beauty", "Electronics", "Fashion", "Home & Garden"]},
-    "Home & Garden": {"avg_price": 2549, "neighbors": ["Books", "Beauty", "Electronics", "Fashion", "Sports"]},
-}
-```
-
-Since all 6 categories are connected to all others, A* will find direct paths for closely related categories (low co-purchase cost) and longer indirect paths for distant ones.
-
----
-
-## Unchanged: Function Signature
-
-```python
-def find_product_path(user_profile: dict, target_category: str) -> list[str]:
-    """
-    Find the A* path from the user's entry category to the target category.
+    BFS on category similarity graph.
 
     Parameters
     ----------
-    user_profile    : dict — from build_user_profile() in src/constants.py
-    target_category : str  — one of PRODUCT_CATEGORIES
+    user_profile : dict  — from build_user_profile() in src/constants.py
+    eligible     : list  — output of apply_rules(), subset of PRODUCT_CATEGORIES
+    max_hops     : int   — maximum BFS depth (default 2)
+    threshold    : float — minimum similarity to traverse an edge (default 0.40)
 
     Returns
     -------
-    list[str] — ordered category steps from start to target (inclusive)
-               Returns [] if no path found.
-
-    Example
-    -------
-    find_product_path(SAMPLE_PROFILES['tech_spender'], 'Electronics')
-    → ['Fashion', 'Sports', 'Electronics']  # path via co-purchase affinity
+    list[str] — subset of eligible, ordered by BFS discovery (closest first).
+                If favourite_category is None, returns eligible as-is.
     """
+    import pickle
+
+    start = user_profile.get('favourite_category')
+    if not start:
+        return eligible   # no start node: return eligible unchanged
+
+    cat_sim = pickle.load(open('models/category_similarity.pkl', 'rb'))
+
+    visited = {start}
+    queue   = [(start, 0)]
+    result  = [start] if start in eligible else []
+
+    while queue:
+        node, hops = queue.pop(0)
+        if hops >= max_hops:
+            continue
+        neighbours = cat_sim[node].drop(node).sort_values(ascending=False)
+        for neighbour, sim in neighbours.items():
+            if sim < threshold:
+                break   # sorted descending — no point continuing
+            if neighbour not in visited:
+                visited.add(neighbour)
+                if neighbour in eligible:
+                    result.append(neighbour)
+                queue.append((neighbour, hops + 1))
+
+    return result
+```
+
+**Worked example — home_decorator:**
+```
+eligible      = all 8 categories (Frequent buyer, Rule 9)
+favourite     = "Home Decor"
+Hop 1: Kitchen & Dining (~0.81), Seasonal & Gifts (~0.74),
+        Stationery & Craft (~0.61), Garden & Outdoor (~0.44)
+Hop 2: Toys & Games (via Kitchen & Dining),
+        Food & Confectionery (via Seasonal & Gifts)
+Fashion & Accessories has low similarity to Home Decor → pruned
+
+→ returns 7 categories (Fashion & Accessories excluded)
+```
+
+**Worked example — craft_lover:**
+```
+eligible      = ["Stationery & Craft", + 1 adjacent] (Rule 7, single-cat buyer)
+favourite     = "Stationery & Craft"
+All eligible categories reachable in hop 1 → no pruning
+→ returns all eligible (already tight from rules)
 ```
 
 ---
 
-## Expected Paths for SAMPLE_PROFILES
+### Function 2: `find_popular_categories(eligible, price_range, top_n=3) -> list[tuple[str, int]]`
 
-These are illustrative — actual paths depend on your computed co-purchase matrix:
+**For new users (purchase_history is empty). Cold-start fallback.**
 
-| Profile | Spend | Likely start | Target | Expected path concept |
-|---|---|---|---|---|
-| budget_browser | ₹800 | Books | Electronics | Long path via affinity |
-| beauty_enthusiast | ₹1,800 | Beauty | Electronics | Via Fashion or Sports |
-| fashion_fan | ₹2,500 | Fashion | Electronics | Short — Fashion→Electronics likely high co-purchase |
-| fitness_guy | ₹3,200 | Sports | Electronics | Short — Sports→Electronics likely high co-purchase |
-| tech_spender | ₹4,500 | Electronics | Electronics | [Electronics] — already there |
+Returns the most globally purchased categories within the eligible set,
+ordered by total unique buyers (descending).
+
+```python
+def find_popular_categories(
+    eligible:    list,
+    price_range: str,
+    top_n:       int = 3,
+) -> list[tuple[str, int]]:
+    """
+    Popularity-based category ranking for cold-start users.
+
+    Parameters
+    ----------
+    eligible    : list — output of apply_rules()
+    price_range : str  — "Low"|"Mid-Low"|"Mid-High"|"High"
+    top_n       : int  — number of categories to return
+
+    Returns
+    -------
+    list[tuple[str, int]] — [(category, unique_buyer_count), ...]
+                             ordered by unique_buyer_count descending
+    """
+    import pickle
+
+    catalogue = pickle.load(open('models/product_catalogue.pkl', 'rb'))
+    counts = (
+        catalogue[catalogue['category'].isin(eligible)]
+        .groupby('category')['popularity_rank']
+        .sum()
+        .sort_values(ascending=False)
+    )
+    return [(cat, int(count)) for cat, count in counts.head(top_n).items()]
+```
+
+**Worked example — new_customer:**
+```
+eligible    = ["Home Decor", "Seasonal & Gifts", "Kitchen & Dining"]
+→ [("Home Decor", 8420), ("Seasonal & Gifts", 5310), ("Kitchen & Dining", 4190)]
+  (exact counts from training data — Home Decor dominant at ~56% of products)
+```
+
+---
+
+## Artefacts to Load
+
+| File | Used by | Contains |
+|---|---|---|
+| `models/category_similarity.pkl` | `find_reachable_categories` | 8×8 pandas DataFrame, category→category cosine similarity |
+| `models/product_catalogue.pkl` | `find_popular_categories` | DataFrame: StockCode, Description, category, avg_price, popularity_rank |
+
+---
+
+## Constants to Import
+
+```python
+from src.constants import PRODUCT_CATEGORIES
+```
+
+---
+
+## Public Interface
+
+```python
+# For returning users — called when purchase_history is non-empty
+find_reachable_categories(
+    user_profile: dict,
+    eligible:     list,
+    max_hops:     int   = 2,
+    threshold:    float = 0.40,
+) -> list[str]
+
+# For new users — called when purchase_history is empty
+find_popular_categories(
+    eligible:    list,
+    price_range: str,
+    top_n:       int = 3,
+) -> list[tuple[str, int]]
+```
 
 ---
 
 ## What To Do
 
-1. Pull `src/constants.py` from `main` (Member 3 has already updated it)
-2. Run the co-purchase matrix calculation once from suvroo data
-3. Hardcode `CO_PURCHASE_COSTS` dict into your module
-4. Replace price-based `heuristic()` and `edge_cost()` with co-purchase versions
-5. Replace `get_start_category()` with browsing-history version
-6. Update graph from 8 nodes to 6 nodes
-7. Keep `find_product_path()` signature identical — Member 4 calls this
-8. Update markdown cells in your notebook section to explain the new heuristic
+1. Pull `src/constants.py` and `models/*.pkl` from `main` (artefacts saved by Member 3)
+2. Create `src/search_module.py` and implement both functions
+3. Test `find_reachable_categories()` on `home_decorator` and `craft_lover` SAMPLE_PROFILES
+4. Test `find_popular_categories()` on `new_customer` SAMPLE_PROFILE
+5. Verify: `find_reachable_categories` always returns a **subset** of `eligible`
 
 ## Rules
-- Never change `find_product_path()` signature
-- All category names come from `src/constants.py PRODUCT_CATEGORIES`
+
+- Both function signatures are fixed — Member 4 calls them directly
+- `find_reachable_categories` must never return categories outside `eligible`
+- `find_popular_categories` scores must be integers (not floats)
+- Never hardcode category names — use `PRODUCT_CATEGORIES` from `src/constants.py`
 - Do not push — user pushes manually
 - PRs must be draft: `gh pr create --draft`

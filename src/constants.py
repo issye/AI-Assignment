@@ -5,282 +5,284 @@
 #
 # ALL MODULES MUST IMPORT FROM THIS FILE.
 # Do not hardcode category names, field values, or price figures anywhere else.
-# If you need to add/change something, update here and notify the team.
 #
-# DATASET: data/suvroo/customer_data_collection.csv
-#          data/suvroo/product_recommendation_data.csv
-# 10,000 customers | 10,000 products | Indian market (₹ currency)
-# All values below are derived from this dataset.
+# DATASET: data/online+retail/Online Retail.xlsx
+#          UCI Online Retail Dataset — 397,884 transactions
+#          UK gift/novelty retailer, Dec 2010 – Dec 2011, £ currency
+#          4,338 customers | 3,665 products | 8 categories
 #
-# PIVOT NOTE (2026-06-06):
-# System now recommends specific PRODUCTS (not just categories).
-# Two public ML functions:
-#   predict_product(user_profile, candidates)  → ranked categories
-#   recommend_products(user_profile, category) → specific product names
-# See agent_handoff/ml_handoff.md for full architecture details.
+# APPROACH: Item-Based Collaborative Filtering (CF)
+#   No demographics — CF does not require age, gender, or city.
+#   User identity is derived entirely from purchase behaviour.
+#
+# PUBLIC INTERFACE:
+#   Member 2 — apply_rules(user_profile)              → list[str]
+#   Member 1 — find_reachable_categories(...)          → list[str]
+#              find_popular_categories(...)             → list[tuple[str,int]]
+#   Member 3 — predict_product(user_profile, ...)      → list[tuple[str,float]]
+#              recommend_products(user_profile, ...)   → list[dict]
+#   Member 4 — recommend(user_profile)                 → dict
+#
+# PIVOT NOTE (2026-06-07):
+#   Pivoted from suvroo dataset (synthetic, Indian, ₹) to UCI Online Retail
+#   (real transactions, UK, £). Recommendation approach changed from binary
+#   ML classifier to item-based collaborative filtering.
+#   Demographics (age, gender, city) removed — not available in Online Retail.
+#   price_range and customer_segment retained as cold-start signals only.
 # =============================================================================
 
 
 # -----------------------------------------------------------------------------
 # PRODUCT CATEGORIES
-# 6 product labels — exact strings used as ML class labels.
-#   - Rules engine  (apply_rules)        must return values from this list
-#   - A* graph      (find_product_path)  must use these as node names
-#   - ML model      (predict_product)    must use these as class labels
+# 8 categories derived from keyword-matching on product Descriptions.
+# Mapping stored in data/online+retail/product_categories.csv.
 #
-# NOTE: reduced from 8 to 6 categories (Food and Toys removed).
-#       "Fitness" in suvroo data maps to "Sports" here.
-#       "Home Decor" in suvroo data maps to "Home & Garden" here.
+# Rules engine  (apply_rules)               must return values from this list
+# Search module (find_reachable_categories) must use these as graph nodes
+# CF model      (predict_product)           must use these as candidate labels
 # -----------------------------------------------------------------------------
 PRODUCT_CATEGORIES = [
-    "Books",
-    "Beauty",
-    "Electronics",
-    "Fashion",
-    "Sports",
-    "Home & Garden",
+    "Home Decor",
+    "Kitchen & Dining",
+    "Seasonal & Gifts",
+    "Toys & Games",
+    "Stationery & Craft",
+    "Fashion & Accessories",
+    "Garden & Outdoor",
+    "Food & Confectionery",
 ]
 
 
 # -----------------------------------------------------------------------------
-# CATEGORY AVERAGE PRICES
-# Derived from suvroo product_recommendation_data.csv (mean Price per category).
-# NOTE: prices are nearly flat (~₹2,500 across all categories) because suvroo
-# products were price-randomised. A* therefore uses co-purchase frequency for
-# edge costs — NOT price gaps. These values are kept for reference only and
-# for any fallback price-fit calculations in the ML layer.
+# CATEGORY AVERAGE PRICES (£)
+# Derived from Online Retail dataset (mean UnitPrice per category).
+# Used as reference only — not used directly in CF scoring.
 # -----------------------------------------------------------------------------
 CATEGORY_AVG_PRICES = {
-    "Books":         2524,
-    "Beauty":        2501,
-    "Electronics":   2548,
-    "Fashion":       2618,
-    "Sports":        2578,
-    "Home & Garden": 2549,
+    "Home Decor":            2.48,
+    "Kitchen & Dining":      3.12,
+    "Seasonal & Gifts":      2.91,
+    "Toys & Games":          3.45,
+    "Stationery & Craft":    1.87,
+    "Fashion & Accessories": 4.23,
+    "Garden & Outdoor":      2.74,
+    "Food & Confectionery":  2.15,
 }
 
 
 # -----------------------------------------------------------------------------
-# SPEND QUARTILE BOUNDARIES
-# Derived from suvroo customer_data_collection.csv Avg_Order_Value column.
-# Q1=₹1,636 | Median=₹2,740 | Q3=₹3,879 | Range: ₹500–₹5,000
+# SPEND QUARTILE BOUNDARIES (£)
+# Derived from Online Retail customer avg_order_value distribution.
+#   Q1 = £178.62  (Low / Mid-Low boundary)
+#   Q2 = £293.90  (Mid-Low / Mid-High boundary)
+#   Q3 = £430.11  (Mid-High / High boundary)
 #
-#   Low      : Avg_Order_Value < 1636
-#   Mid-Low  : 1636 <= Avg_Order_Value < 2740
-#   Mid-High : 2740 <= Avg_Order_Value < 3879
-#   High     : Avg_Order_Value >= 3879
+# NOTE: Values are high because some customers are wholesale buyers placing
+# large repeat orders. The quartile split correctly reflects the distribution.
+#
+#   Low      : avg_order_value < £178.62     (bottom 25%)
+#   Mid-Low  : £178.62 – £293.90
+#   Mid-High : £293.90 – £430.11
+#   High     : >= £430.11                    (top 25%)
 # -----------------------------------------------------------------------------
 PRICE_RANGES = ["Low", "Mid-Low", "Mid-High", "High"]
 
 SPEND_THRESHOLDS = {
-    "Low":      (0,     1636),
-    "Mid-Low":  (1636,  2740),
-    "Mid-High": (2740,  3879),
-    "High":     (3879,  float("inf")),
+    "Low":      (0,       178.62),
+    "Mid-Low":  (178.62,  293.90),
+    "Mid-High": (293.90,  430.11),
+    "High":     (430.11,  float("inf")),
 }
 
-def get_price_range(median_spend: float) -> str:
-    """Return the spend tier label for a given Avg_Order_Value (₹)."""
+def get_price_range(avg_order_value: float) -> str:
+    """Return the spend tier label for a given avg_order_value (£)."""
     for tier, (low, high) in SPEND_THRESHOLDS.items():
-        if low <= median_spend < high:
+        if low <= avg_order_value < high:
             return tier
     return "High"
 
 
 # -----------------------------------------------------------------------------
-# AGE GROUPS
-# Used by rules engine for demographic filtering.
-# -----------------------------------------------------------------------------
-AGE_GROUPS = ["18-25", "26-35", "36-45", "46-55", "56+"]
-
-def get_age_group(age: int) -> str:
-    """Map a numeric age to its age group label."""
-    if age <= 25:  return "18-25"
-    if age <= 35:  return "26-35"
-    if age <= 45:  return "36-45"
-    if age <= 55:  return "46-55"
-    return "56+"
-
-
-# -----------------------------------------------------------------------------
-# GENDERS
-# Exact strings from the suvroo Gender column.
-# -----------------------------------------------------------------------------
-GENDERS = ["Female", "Male", "Other"]
-
-
-# -----------------------------------------------------------------------------
-# CITIES
-# 5 Indian cities from the suvroo Location column.
-# Urban cities (Mumbai, Delhi, Bangalore) vs regional — used by rules engine.
-# NOTE: changed from Turkish cities to Indian cities to match suvroo dataset.
-# -----------------------------------------------------------------------------
-CITIES = ["Bangalore", "Chennai", "Delhi", "Kolkata", "Mumbai"]
-
-URBAN_CITIES = ["Mumbai", "Delhi", "Bangalore"]
-
-
-# -----------------------------------------------------------------------------
 # CUSTOMER SEGMENTS
-# Exact strings from the suvroo Customer_Segment column.
-# Used by rules engine and ML model as a behavioral feature.
-#   New Visitor      — first-time or rare buyer, limited history
-#   Occasional Shopper — buys periodically across categories
-#   Frequent Buyer   — high purchase frequency, broadest category range
+# Derived from number of unique invoices per customer.
+#   New        : total_invoices <= 2   (2,328 customers — 53.7%)
+#   Occasional : 3–10 invoices         (1,673 customers — 38.6%)
+#   Frequent   : > 10 invoices         (  337 customers —  7.8%)
+#
+# Used by rules engine for cold-start category gating.
+# For returning users with purchase history, CF subsumes this signal.
 # -----------------------------------------------------------------------------
-CUSTOMER_SEGMENTS = ["New Visitor", "Occasional Shopper", "Frequent Buyer"]
+CUSTOMER_SEGMENTS = ["New", "Occasional", "Frequent"]
 
-
-# -----------------------------------------------------------------------------
-# DEVICE TYPES & PAYMENT METHODS
-# Kept for build_user_profile() compatibility.
-# ML model does not use these (not present in suvroo dataset).
-# Rules engine may use device_type for secondary filtering.
-# -----------------------------------------------------------------------------
-DEVICE_TYPES = ["Desktop", "Mobile", "Tablet"]
-
-PAYMENT_METHODS = [
-    "Bank Transfer", "Cash on Delivery", "Credit Card",
-    "Debit Card", "Digital Wallet",
-]
+def get_customer_segment(total_invoices: int) -> str:
+    """Map invoice count to customer segment label."""
+    if total_invoices <= 2:
+        return "New"
+    if total_invoices <= 10:
+        return "Occasional"
+    return "Frequent"
 
 
 # -----------------------------------------------------------------------------
 # USER PROFILE SCHEMA
-# Standard input format for ALL three modules.
+# Standard input format for ALL modules.
 #
-#   apply_rules(user_profile)               → list[str]  eligible categories
-#   find_product_path(user_profile,         → list[str]  path of categories
-#                     target_category)
-#   predict_product(user_profile,           → list[tuple[str, float]]
-#                   candidates=None)           [(category, confidence), ...]
-#   recommend_products(user_profile,        → list[tuple[str, float]]
-#                      category, top_n=3)      [(product_name, score), ...]
+# IMPORTANT: No age, gender, or city fields — not available in Online Retail.
+# purchase_history uses StockCode strings (e.g. '85123A', '71053').
+# favourite_category and purchased_categories are derived from purchase_history
+# during build_user_profile() — do not set them manually.
 #
-# NOTE ON MEDIAN_SPEND: pass the user's Avg_Order_Value in ₹ (e.g. 2500.0).
-#                       Use raw amount — not normalised.
-# NOTE ON CUSTOMER_SEGMENT: optional — defaults to "Occasional Shopper".
-#                            Pass when known for better rule/ML accuracy.
+# NOTE ON COLD-START: If purchase_history is empty, the system falls back to
+# popularity-based recommendations via the search module. Member 4 handles
+# routing between personalised (CF) and popular (cold-start) paths.
 # -----------------------------------------------------------------------------
 
 def build_user_profile(
-    age:              int,
-    gender:           str,
-    city:             str,
-    median_spend:     float,
-    device_type:      str = "Mobile",
-    payment_method:   str = "Credit Card",
-    customer_segment: str = "Occasional Shopper",
+    customer_id:      str,
+    purchase_history: list,
+    avg_order_value:  float,
+    total_invoices:   int   = 1,
+    recency_days:     int   = 30,
+    _category_map:    dict  = None,   # internal: StockCode→category, injected by notebook
 ) -> dict:
     """
-    Build and validate a user profile dict.
-    Raises ValueError if any field contains an unrecognised value.
+    Build and validate a user profile dict from Online Retail transaction data.
 
     Parameters
     ----------
-    age              : int, 18-60 (suvroo age range)
-    gender           : one of GENDERS
-    city             : one of CITIES (Indian cities)
-    median_spend     : float, user's Avg_Order_Value in ₹ (500–5000 range)
-    device_type      : one of DEVICE_TYPES (optional, not used by ML)
-    payment_method   : one of PAYMENT_METHODS (optional, not used by ML)
-    customer_segment : one of CUSTOMER_SEGMENTS (default: Occasional Shopper)
+    customer_id      : str   — CustomerID from Online Retail (e.g. '17850')
+    purchase_history : list  — StockCodes the customer has bought (e.g. ['85123A','71053'])
+                               Pass [] for new customers with no history.
+    avg_order_value  : float — Mean basket value in £ across all invoices
+    total_invoices   : int   — Number of distinct invoices (used for segment)
+    recency_days     : int   — Days since last order (ref: 2011-12-09)
+    _category_map    : dict  — Optional StockCode→category lookup injected by the notebook
+                               to derive favourite_category and purchased_categories.
+                               If not provided these fields are set to None / [].
 
     Returns
     -------
-    dict with all fields validated, plus derived fields: age_group, price_range
+    dict with all fields plus derived: price_range, customer_segment,
+    favourite_category, purchased_categories
     """
-    if not (18 <= age <= 75):
-        raise ValueError("age must be between 18 and 75")
-    if gender not in GENDERS:
-        raise ValueError(f"gender must be one of {GENDERS}")
-    if city not in CITIES:
-        raise ValueError(f"city must be one of {CITIES}")
-    if median_spend < 0:
-        raise ValueError("median_spend must be non-negative")
-    if device_type not in DEVICE_TYPES:
-        raise ValueError(f"device_type must be one of {DEVICE_TYPES}")
-    if payment_method not in PAYMENT_METHODS:
-        raise ValueError(f"payment_method must be one of {PAYMENT_METHODS}")
-    if customer_segment not in CUSTOMER_SEGMENTS:
-        raise ValueError(f"customer_segment must be one of {CUSTOMER_SEGMENTS}")
+    if avg_order_value < 0:
+        raise ValueError("avg_order_value must be non-negative")
+    if recency_days < 0:
+        raise ValueError("recency_days must be non-negative")
+
+    # Derive category fields if category map provided
+    favourite_category   = None
+    purchased_categories = []
+    if _category_map and purchase_history:
+        bought_cats = [_category_map.get(str(sc)) for sc in purchase_history
+                       if _category_map.get(str(sc))]
+        if bought_cats:
+            purchased_categories = list(dict.fromkeys(bought_cats))   # unique, order preserved
+            from collections import Counter
+            favourite_category = Counter(bought_cats).most_common(1)[0][0]
 
     return {
-        "age":              int(age),
-        "gender":           gender,
-        "city":             city,
-        "median_spend":     float(median_spend),
-        "device_type":      device_type,
-        "payment_method":   payment_method,
-        "customer_segment": customer_segment,
-        "age_group":        get_age_group(age),
-        "price_range":      get_price_range(median_spend),
+        "customer_id":          str(customer_id),
+        "purchase_history":     [str(sc) for sc in purchase_history],
+        "avg_order_value":      float(avg_order_value),
+        "total_invoices":       int(total_invoices),
+        "recency_days":         int(recency_days),
+        "price_range":          get_price_range(avg_order_value),
+        "customer_segment":     get_customer_segment(total_invoices),
+        "favourite_category":   favourite_category,
+        "purchased_categories": purchased_categories,
     }
 
 
 # -----------------------------------------------------------------------------
 # SAMPLE USER PROFILES
-# Use these to test your module during development.
-# Member 4 will use these for the final integration demo.
-# Updated to reflect Indian cities and ₹ spend range from suvroo dataset.
+# Built from real Online Retail customers for testing and demo.
+# CustomerIDs are real IDs from the dataset.
 #
-# Profile          | Age | Gender | City      | Spend  | Tier     | Segment
-# budget_browser   |  22 | Female | Chennai   |  ₹800  | Low      | New Visitor
-# beauty_enthusiast|  30 | Female | Mumbai    | ₹1800  | Mid-Low  | Frequent Buyer
-# fashion_fan      |  27 | Male   | Delhi     | ₹2500  | Mid-Low  | Occasional
-# fitness_guy      |  35 | Male   | Bangalore | ₹3200  | Mid-High | Frequent Buyer
-# tech_spender     |  42 | Male   | Mumbai    | ₹4500  | High     | Frequent Buyer
+# Profile              | ID    | Segment    | Spend   | Favourite
+# gift_buyer           | 13058 | Occasional | Low     | Seasonal & Gifts
+# home_decorator       | 13094 | Frequent   | Low     | Home Decor
+# kitchen_enthusiast   | 13631 | Frequent   | Mid-Low | Kitchen & Dining
+# craft_lover          | 14460 | Occasional | Low     | Stationery & Craft
+# new_customer         | N/A   | New        | Low     | None (cold-start)
+#
+# NOTE: favourite_category and purchased_categories are pre-populated here
+# since _category_map is not available at import time. They reflect the
+# real purchase history of each customer in the dataset.
 # -----------------------------------------------------------------------------
+
+def _make_profile(customer_id, purchase_history, avg_order_value, total_invoices,
+                  recency_days, favourite_category, purchased_categories):
+    """Build a profile dict directly (bypasses category map derivation)."""
+    return {
+        "customer_id":          str(customer_id),
+        "purchase_history":     [str(sc) for sc in purchase_history],
+        "avg_order_value":      float(avg_order_value),
+        "total_invoices":       int(total_invoices),
+        "recency_days":         int(recency_days),
+        "price_range":          get_price_range(avg_order_value),
+        "customer_segment":     get_customer_segment(total_invoices),
+        "favourite_category":   favourite_category,
+        "purchased_categories": purchased_categories,
+    }
+
 
 SAMPLE_PROFILES = {
 
-    "budget_browser": build_user_profile(
-        age              = 22,
-        gender           = "Female",
-        city             = "Chennai",
-        median_spend     = 800.0,       # Low tier → Books / Beauty
-        device_type      = "Mobile",
-        payment_method   = "Credit Card",
-        customer_segment = "New Visitor",
+    # Occasional buyer, Low spend, loves seasonal and gift products
+    "gift_buyer": _make_profile(
+        customer_id          = "13058",
+        purchase_history     = ["47590B", "47590A", "23298", "23313", "22776"],
+        avg_order_value      = 33.93,
+        total_invoices       = 5,
+        recency_days         = 24,
+        favourite_category   = "Seasonal & Gifts",
+        purchased_categories = ["Seasonal & Gifts", "Garden & Outdoor", "Kitchen & Dining"],
     ),
 
-    "beauty_enthusiast": build_user_profile(
-        age              = 30,
-        gender           = "Female",
-        city             = "Mumbai",
-        median_spend     = 1800.0,      # Mid-Low → Beauty / Fashion
-        device_type      = "Mobile",
-        payment_method   = "Credit Card",
-        customer_segment = "Frequent Buyer",
+    # Frequent buyer, Home Decor focus, active shopper
+    "home_decorator": _make_profile(
+        customer_id          = "13094",
+        purchase_history     = ["22174", "22791", "84946", "85123A"],
+        avg_order_value      = 80.31,
+        total_invoices       = 12,
+        recency_days         = 20,
+        favourite_category   = "Home Decor",
+        purchased_categories = ["Home Decor", "Food & Confectionery"],
     ),
 
-    "fashion_fan": build_user_profile(
-        age              = 27,
-        gender           = "Male",
-        city             = "Delhi",
-        median_spend     = 2500.0,      # Mid-Low → Fashion / Sports
-        device_type      = "Mobile",
-        payment_method   = "Debit Card",
-        customer_segment = "Occasional Shopper",
+    # Frequent buyer, Kitchen focus, higher spend, slightly dormant
+    "kitchen_enthusiast": _make_profile(
+        customer_id          = "13631",
+        purchase_history     = ["22423", "22968", "22625", "23173", "23118", "21257"],
+        avg_order_value      = 279.13,
+        total_invoices       = 14,
+        recency_days         = 99,
+        favourite_category   = "Kitchen & Dining",
+        purchased_categories = ["Kitchen & Dining", "Home Decor", "Fashion & Accessories"],
     ),
 
-    "fitness_guy": build_user_profile(
-        age              = 35,
-        gender           = "Male",
-        city             = "Bangalore",
-        median_spend     = 3200.0,      # Mid-High → Sports / Electronics
-        device_type      = "Desktop",
-        payment_method   = "Credit Card",
-        customer_segment = "Frequent Buyer",
+    # Occasional buyer, craft and stationery focus, dormant (109 days)
+    "craft_lover": _make_profile(
+        customer_id          = "14460",
+        purchase_history     = ["85019C", "17003", "21703", "85019A", "35651",
+                                "21634", "21391", "20984", "20840", "10133",
+                                "51014C", "51014L", "35646", "20992"],
+        avg_order_value      = 27.15,
+        total_invoices       = 7,
+        recency_days         = 109,
+        favourite_category   = "Stationery & Craft",
+        purchased_categories = ["Stationery & Craft", "Fashion & Accessories", "Home Decor"],
     ),
 
-    "tech_spender": build_user_profile(
-        age              = 42,
-        gender           = "Male",
-        city             = "Mumbai",
-        median_spend     = 4500.0,      # High tier → Electronics
-        device_type      = "Desktop",
-        payment_method   = "Credit Card",
-        customer_segment = "Frequent Buyer",
+    # New customer — no purchase history (cold-start path)
+    "new_customer": _make_profile(
+        customer_id          = "NEW_001",
+        purchase_history     = [],
+        avg_order_value      = 25.00,
+        total_invoices       = 1,
+        recency_days         = 0,
+        favourite_category   = None,
+        purchased_categories = [],
     ),
 }
