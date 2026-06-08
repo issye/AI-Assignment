@@ -1,140 +1,268 @@
 # System Architecture — CIC6314 Smart Product Recommendation System
 
-> **Pivoted 2026-06-07:** suvroo (synthetic) → UCI Online Retail (real UK transactions)
-> Approach: Item-Based Collaborative Filtering + Popularity Fallback
+> **Dataset:** UCI Online Retail (real UK transactions, Dec 2010 – Dec 2011)
+> **Approach:** ALS Collaborative Filtering + Random Forest Blend + Rules + BFS Search
 
-```mermaid
-flowchart TD
-    %% ── Data Layer ──────────────────────────────────────────────
-    subgraph DATA["Data Layer  (data/online+retail/)"]
-        OR[("Online Retail.xlsx\n397,884 transactions\n4,338 customers · 3,665 products\nRead-only — never modified")]
-        PC[("product_categories.csv\nDerived lookup\nStockCode → 8 categories")]
-    end
+---
 
-    %% ── Shared Config ───────────────────────────────────────────
-    subgraph CONST["src/constants.py  (shared config)"]
-        BUP["build_user_profile()\ncustomer_id · purchase_history\navg_order_value · segment · recency"]
-        SP["SAMPLE_PROFILES\n5 real Online Retail customers"]
-        CFG["PRODUCT_CATEGORIES (8)\nSPEND_THRESHOLDS (£)\nCUSTOMER_SEGMENTS"]
-    end
+## Full Pipeline
 
-    %% ── Offline Training ────────────────────────────────────────
-    subgraph TRAIN["notebooks/ml_model.ipynb  (Member 3 — run once)"]
-        CLEAN["S1-2: Clean + Category Engineering"]
-        FEAT["S3-4: Customer Features\nUser-Item Matrix (binary)"]
-        SIM["S5: Item-Item Cosine Similarity\n3,665 × 3,665 matrix\n+ 8×8 Category Similarity"]
-        POP["S6: Global Popularity Table\nunique buyers per product"]
-        EVAL["S7: Hit Rate@K evaluation"]
-        ART["S8: Save 5 artefacts\nsimilarity_matrix · product_catalogue\ncategory_similarity · customer_features\nencoder_category"]
-    end
-
-    %% ── Inference Modules ───────────────────────────────────────
-    subgraph INFER["Inference Layer  (src/)"]
-        RE["rules_engine.py  (Member 2)\napply_rules(user_profile)\n→ eligible: list[str]\n10 behavioural rules\nno demographics"]
-        SM["search_module.py  (Member 1)\nfind_reachable_categories(...)\n→ shortlist: list[str]\n\nfind_popular_categories(...)\n→ list[tuple[str,int]]"]
-        CF["CF Inference  (Member 3, notebook)\npredict_product(user_profile, candidates)\n→ [(category, score)]\n\nrecommend_products(user_profile, category)\n→ [dict(category,product,score)]"]
-    end
-
-    %% ── Two Paths ───────────────────────────────────────────────
-    subgraph PATHS["Two Recommendation Paths  (Member 4 routes)"]
-        PERS["Personalised Path\npurchase_history non-empty\nCF drives scoring"]
-        COLD["Popular Path\npurchase_history empty\nPopularity drives scoring"]
-    end
-
-    %% ── Orchestration ───────────────────────────────────────────
-    subgraph ORCH["notebooks/career_recommender.ipynb  (Member 4)\nrecommend(user_profile) → dict"]
-        OUT["{\n  recommendation_type: personalised|popular\n  top_3_categories: [(cat, score), ...]\n  recommended_products: [dict × 9]\n  eligible: [str]\n}"]
-    end
-
-    %% ── Edges: offline ──────────────────────────────────────────
-    OR --> CLEAN --> FEAT --> SIM --> EVAL
-    OR --> POP
-    SIM --> ART
-    POP --> ART
-    PC --> CONST
-
-    %% ── Edges: shared config ─────────────────────────────────────
-    OR --> CONST
-    CONST --> BUP
-
-    %% ── Edges: inference ────────────────────────────────────────
-    BUP --> RE
-    ART -->|"category_similarity.pkl\nproduct_catalogue.pkl"| SM
-    ART -->|"similarity_matrix.pkl\nproduct_catalogue.pkl"| CF
-
-    RE -->|"eligible categories"| SM
-    RE -->|"eligible categories"| CF
-
-    SM -->|"shortlist (returning)"| PERS
-    SM -->|"popular ranking (new)"| COLD
-    CF -->|"category + product scores"| PERS
-
-    PERS --> ORCH
-    COLD --> ORCH
-    ORCH --> OUT
 ```
+User Profile (build_user_profile)
+        │
+        ▼
+┌─────────────────────────────────┐
+│  Rules Engine  (Member 2)       │
+│  apply_rules(profile)           │
+│  → eligible: list[str]          │
+│                                 │
+│  10 behavioural rules based on  │
+│  spend tier, purchase history,  │
+│  recency, and segment           │
+└────────────┬────────────────────┘
+             │
+             ├── purchase_history EMPTY (new customer)
+             │         │
+             │         ▼
+             │   ┌─────────────────────────────────┐
+             │   │  Search Module  (Member 1)       │
+             │   │  find_popular_categories()       │
+             │   │  → [(category, buyer_count), ...]│
+             │   └─────────────┬───────────────────┘
+             │                 │
+             │                 ▼
+             │   ┌─────────────────────────────────┐
+             │   │  Integration  (Member 4)         │
+             │   │  get_popular_products()          │
+             │   │  recommendation_type = "popular" │
+             │   └─────────────────────────────────┘
+             │
+             └── purchase_history NON-EMPTY (returning customer)
+                       │
+                       ▼
+               ┌─────────────────────────────────┐
+               │  Search Module  (Member 1)       │
+               │  find_reachable_categories()     │
+               │  BFS on 8×8 category graph       │
+               │  → shortlist: list[str]          │
+               └──────────────┬──────────────────┘
+                              │
+                              ▼
+               ┌─────────────────────────────────┐
+               │  ML Module  (Member 3)           │
+               │  predict_product(profile,        │
+               │    candidates=shortlist)         │
+               │                                 │
+               │  RF Blend: Model A (context)    │
+               │          + Model B (history)    │
+               │  → [(category, score), ...]     │
+               └──────────────┬──────────────────┘
+                              │  top 3 categories
+                              ▼
+               ┌─────────────────────────────────┐
+               │  ML Module  (Member 3)           │
+               │  recommend_products(profile,     │
+               │    category, top_n=3) × 3        │
+               │                                 │
+               │  ALS item similarity lookup      │
+               │  → [{"category","product",       │
+               │       "price","score"}, ...]     │
+               └──────────────┬──────────────────┘
+                              │
+                              ▼
+               ┌─────────────────────────────────┐
+               │  Integration  (Member 4)         │
+               │  recommend(profile) → dict       │
+               └─────────────────────────────────┘
+```
+
+---
+
+## Output Schema
+
+```python
+# Personalised (returning user) — scores are RF probabilities (0–1)
+{
+    "recommendation_type": "personalised",
+    "top_3_categories": [
+        ("Home Decor",       0.61),
+        ("Kitchen & Dining", 0.44),
+        ("Food & Confectionery", 0.38),
+    ],
+    "recommended_products": [
+        {"category": "Home Decor", "product": "WHITE METAL LANTERN",
+         "price": 3.95, "score": 0.4231},
+        # ... 8 more items (3 per category)
+    ],
+    "eligible": ["Home Decor", "Kitchen & Dining", ...],
+}
+
+# Popular (cold-start / new user) — scores are integer buyer counts
+{
+    "recommendation_type": "popular",
+    "top_3_categories": [
+        ("Home Decor",       8420),
+        ("Seasonal & Gifts", 5310),
+        ("Kitchen & Dining", 4190),
+    ],
+    "recommended_products": [
+        {"category": "Home Decor", "product": "WHITE METAL LANTERN",
+         "price": 3.95, "score": 847},
+        # ... 8 more items
+    ],
+    "eligible": ["Home Decor", "Seasonal & Gifts", "Kitchen & Dining"],
+}
+```
+
+---
+
+## ML Module — Training Architecture
+
+### ALS (Alternating Least Squares)
+
+Trained on the full 4,338 × 3,665 binary user-item matrix.
+
+```
+User-Item matrix  →  ALS factorisation  →  Item factors (3665 × 50)
+(4338 × 3665)       50 latent factors      Cosine similarity
+                    50 iterations               ↓
+                    regularization=1.0     Item similarity matrix (3665 × 3665)
+                                               saved: similarity_matrix.pkl
+
+                                          Category similarity matrix (8 × 8)
+                                               saved: category_similarity.pkl
+```
+
+Why ALS instead of raw cosine: ALS compresses 4,338 customer dimensions to 50 latent factors, making similarity computation 86× cheaper and generalising better on sparse data (1.54% density).
+
+### Random Forest Blend
+
+```
+Temporal split: features from < 2011-11-01, labels from >= 2011-11-01
+Customer split: 80% train, 20% test (held-out evaluation)
+
+Training data (df_train_ml):
+  one row per customer
+  features = pre-November stats
+  labels   = which categories bought in November-December
+
+Model A (Context)        Model B (History)
+  3 features               15 features
+  segment_enc              n_purchases
+  price_enc                n_categories
+  month                    recency_days
+                           avg_order_value
+  MultiOutputClassifier    segment_enc
+  RandomForest(100 trees)  price_enc
+  Works for ALL users      favourite_category (9 one-hot columns)
+  incl. cold-start
+                           MultiOutputClassifier
+                           RandomForest(100 trees)
+                           Only for returning users
+
+At inference:
+  confidence = 1 - 1/(1 + n_purchases)
+  score = (1-conf) × Model_A_score + conf × Model_B_score
+```
+
+---
+
+## Data Flow — Training vs Inference
+
+```
+TRAINING (run once, offline)
+
+Online Retail.xlsx
+    │
+    ▼
+notebooks/ml_model.ipynb
+    ├── Section 4:  user-item matrix (4338×3665)
+    ├── Section 5:  category mapping, customer features, product catalogue
+    ├── Section 6a: ALS → similarity_matrix.pkl, category_similarity.pkl
+    ├── Section 6b: temporal split, supervised training rows
+    ├── Train/Test: 80/20 customer split
+    ├── Section 6c: Model A → model_context.pkl
+    ├── Section 6d: Model B → model_history.pkl
+    ├── Section 6e: Evaluation on 20% held-out
+    ├── Section 7:  HR@K evaluation on 20% held-out
+    └── Section 8:  Save 8 pkl artefacts to models/
+
+
+INFERENCE (per user request)
+
+build_user_profile()
+    │
+    ├── loads: model_context.pkl, model_history.pkl  (predict_product)
+    ├── loads: similarity_matrix.pkl                 (recommend_products)
+    ├── loads: product_catalogue.pkl                 (both functions)
+    └── loads: category_similarity.pkl               (search module BFS)
+```
+
+---
+
+## Saved Artefacts
+
+| File | Size | Generated by | Used by |
+|---|---|---|---|
+| `models/als_model.pkl` | ~1.6 MB | ml_model.ipynb | Internal reference |
+| `models/similarity_matrix.pkl` | ~54 MB | ml_model.ipynb | `recommend_products()` |
+| `models/category_similarity.pkl` | <1 MB | ml_model.ipynb | `find_reachable_categories()` |
+| `models/model_context.pkl` | <1 MB | ml_model.ipynb | `predict_product()` Model A |
+| `models/model_history.pkl` | <1 MB | ml_model.ipynb | `predict_product()` Model B |
+| `models/product_catalogue.pkl` | ~1 MB | ml_model.ipynb | Both ML functions + Member 4 |
+| `models/customer_features.pkl` | ~1 MB | ml_model.ipynb | Reference |
+| `models/encoder_category.pkl` | <1 MB | ml_model.ipynb | Reference |
+
+All pkl files are gitignored. Regenerate by running `Kernel → Restart & Run All` on `notebooks/ml_model.ipynb`.
 
 ---
 
 ## Module Status
 
-| Module | Owner | Status |
+| Module | Owner | Branch | Status |
+|---|---|---|---|
+| `src/constants.py` | Member 3 | `feature/ml` | ✅ Complete |
+| `notebooks/ml_model.ipynb` | Member 3 | `feature/ml` | ✅ Written — needs `Restart & Run All` |
+| `src/rules_engine.py` | Member 2 | `feature/rules` | ❌ Not yet implemented |
+| `src/search_module.py` | Member 1 | `feature/search` | ❌ Not yet implemented |
+| `notebooks/career_recommender.ipynb` | Member 4 | `feature/integration` | ❌ Not yet implemented |
+
+---
+
+## Product Categories (8)
+
+Derived from keyword matching on product descriptions in Online Retail.xlsx.
+
+| Category | Sample keywords | Typical price |
 |---|---|---|
-| `src/constants.py` | Member 3 | ✅ Updated — 8 categories, £ thresholds, new profile schema |
-| `notebooks/ml_model.ipynb` | Member 3 | ✅ Rewritten — ❌ needs `Restart & Run All` to save artefacts |
-| `data/online+retail/product_categories.csv` | Member 3 | ✅ Generated |
-| `src/rules_engine.py` | Member 2 | ❌ Not yet implemented (brief: `agent_handoff/rules_handoff.md`) |
-| `src/search_module.py` | Member 1 | ❌ Not yet implemented (brief: `agent_handoff/search_handoff.md`) |
-| `notebooks/career_recommender.ipynb` | Member 4 | ❌ Not yet implemented (brief: `agent_handoff/integration_handoff.md`) |
+| Home Decor | LANTERN, FRAME, CANDLE, VASE, MIRROR, SIGN | £2.48 avg |
+| Kitchen & Dining | MUG, CUP, PLATE, BOWL, TEAPOT, JUG | £3.12 avg |
+| Seasonal & Gifts | CHRISTMAS, XMAS, BIRTHDAY, GIFT, WRAP | £2.91 avg |
+| Toys & Games | TOY, GAME, PUZZLE, DOLL, BEAR, PLAY | £3.45 avg |
+| Stationery & Craft | PEN, CARD, NOTEBOOK, CRAFT, PAPER | £1.87 avg |
+| Fashion & Accessories | BAG, SCARF, JEWEL, NECKLACE, PURSE | £4.23 avg |
+| Garden & Outdoor | GARDEN, PLANT, OUTDOOR, WATERING, POT | £2.74 avg |
+| Food & Confectionery | FOOD, CHOCOLATE, SWEET, BISCUIT, TEA | £2.15 avg |
+
+Default category (unmatched descriptions): Home Decor
 
 ---
 
-## Data Flow Summary
+## Customer Segments
 
-```
-Online Retail.xlsx  (read-only)
-   └─► notebooks/ml_model.ipynb  (run once offline)
-          ├─► similarity_matrix.pkl      (3,665 × 3,665 item cosine similarity)
-          ├─► category_similarity.pkl    (8 × 8 category cosine similarity)
-          ├─► product_catalogue.pkl      (descriptions + categories + popularity)
-          ├─► customer_features.pkl      (per-customer derived features)
-          └─► encoder_category.pkl
+| Segment | Criteria | Count | Share |
+|---|---|---|---|
+| New | ≤ 2 invoices | 2,328 | 53.7% |
+| Occasional | 3–10 invoices | 1,673 | 38.6% |
+| Frequent | > 10 invoices | 337 | 7.8% |
 
-At inference time:
-   build_user_profile()
-          │
-          ▼
-   apply_rules()           → eligible categories  (Member 2)
-          │
-          ├─ purchase_history EMPTY ──────────────────────────
-          │   find_popular_categories()              (Member 1)
-          │   → popular categories + products
-          │   recommendation_type = "popular"
-          │
-          └─ purchase_history NON-EMPTY ──────────────────────
-              find_reachable_categories()            (Member 1)
-              → shortlist (BFS on category graph)
-              predict_product()                      (Member 3)
-              → ranked categories by CF score
-              recommend_products() × 3               (Member 3)
-              → 3 products per top-3 category
-              recommendation_type = "personalised"
-                         │
-                         ▼
-                   recommend()                       (Member 4)
-                   → {recommendation_type, top_3_categories,
-                      recommended_products, eligible}
-```
+## Spend Tiers (£, from real data quartiles)
 
----
+| Tier | Range | Quartile |
+|---|---|---|
+| Low | < £178.62 | Q1 |
+| Mid-Low | £178.62 – £293.90 | Q1–Q2 |
+| Mid-High | £293.90 – £430.11 | Q2–Q3 |
+| High | ≥ £430.11 | Q3+ |
 
-## Key Design Decisions
-
-| Decision | Rationale |
-|---|---|
-| Item-based CF instead of ML classifier | Real co-purchase signal; no data leakage; no synthetic pairs; model is a 50 MB matrix vs 231 MB Random Forest |
-| No demographics | Online Retail has no age/gender; CF doesn't need them |
-| Two-path routing | CF cannot score users with zero purchase history; popularity is the honest cold-start fallback |
-| 8 categories (not 6) | Better reflects Online Retail's natural product distribution |
-| Products from top-3 categories | Avoids over-reliance on single top category; 9 products total per recommendation |
-| `recommendation_type` flag | Signals to display layer whether scores are CF similarity or popularity counts |
+Note: Values appear high because the dataset includes wholesale buyers. The quartile split correctly reflects the actual distribution.

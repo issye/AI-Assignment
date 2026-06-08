@@ -5,188 +5,168 @@
 
 ---
 
-## What Changed and Why
+## What This Module Does
 
-The project has **fully pivoted** from the suvroo dataset to the **UCI Online Retail dataset**
-and from a demographic rule system to a **behavioural rule system**.
+The rules engine is the **first component** every user profile passes through. Its job is to decide which product categories a customer is even eligible to receive recommendations for, before any machine learning runs.
 
-| What changed | Old (suvroo) | New (Online Retail) |
-|---|---|---|
-| Dataset | Synthetic, Indian market, ₹ | Real transactions, UK, £ |
-| Recommendation approach | Rule + ML binary classifier | Item-based Collaborative Filtering (CF) |
-| Rule basis | Demographics (age, gender, city) | Behaviour (spend, purchase history, recency) |
-| Categories | 6 (Books, Beauty, Electronics, Fashion, Sports, Home & Garden) | 8 (see below) |
-| Spend thresholds | ₹ quartiles | £ quartiles from real data |
-| Demographics | Age groups, gender, city, urban flag | **Removed entirely — not in dataset** |
+Think of it as a gatekeeper: it narrows the field of 8 possible categories down to a sensible subset based on what we know about the customer's spending behaviour and purchase history.
 
 ---
 
-## Your Module's New Role
+## Why Rules Matter — The Cold-Start Problem
 
-The rules engine now serves as the **cold-start engine**:
+The ML model (Member 3) learns from purchase history. If a customer has never bought anything, there is no history — the ML model has nothing to work from.
 
-- **New users (no purchase history):** Rules output IS the entire recommendation signal.
-  CF cannot score anything without purchase history — your rules drive everything.
-- **Returning users (have purchase history):** Rules output is the eligible set that
-  CF scores against. Your rules act as a broad gate, CF does the personalisation.
+The rules engine solves this. It uses the signals we *do* have — how much the customer spends, how often they buy, how long since their last order — to produce a reasonable eligible set even when there is zero purchase history.
 
-Member 4 handles routing between both paths — you don't need to know which path is taken.
-Your function always returns an eligible category list.
+**New customers:** the rules engine's output IS the entire recommendation signal. The ML model's category scoring and the search module's BFS are both bypassed. The integration layer (Member 4) routes new users directly to a popularity-based recommendation using only your eligible list.
+
+**Returning customers:** your eligible list acts as a broad gate. The search module then narrows it further using category similarity, and the ML model scores what remains. Your rules set the ceiling; the ML model does the personalisation.
 
 ---
 
-## Function Signature — UNCHANGED
+## How This Module Fits Into the Full Pipeline
+
+```
+User Profile
+     │
+     ▼
+Rules Engine (Member 2)  ◄─── YOU ARE HERE
+  apply_rules(profile) → eligible: list of up to 8 categories
+     │
+     │  (new user with no history?)
+     ├──────────────────────────────────────────────────────────►
+     │                                                          │
+     │  (returning user with history)                          ▼
+     ▼                                               find_popular_categories()
+Search Module (Member 1)                             → popular categories shown
+  find_reachable_categories(profile, eligible)       → no ML scoring needed
+     │
+     ▼
+ML Module (Member 3)
+  predict_product(profile, candidates=shortlist)
+     │
+     ▼
+Integration (Member 4)
+  recommend(profile) → final output dict
+```
+
+The routing decision is made by Member 4. You only need to return the eligible list — you do not need to know which path the user takes.
+
+---
+
+## Function Signature
 
 ```python
 apply_rules(user_profile: dict) -> list[str]
 ```
 
-Returns a subset of `PRODUCT_CATEGORIES`. Order must match `PRODUCT_CATEGORIES` list order.
+- Input: a user profile dict from `build_user_profile()` in `src/constants.py`
+- Output: a list of category strings, each from `PRODUCT_CATEGORIES`
+- Order must match `PRODUCT_CATEGORIES` list order (use the return pattern shown below)
+- Must never return an empty list — use the fallback at the end
 
 ---
 
-## New User Profile Schema
+## User Profile Schema
 
-No age, gender, city, or device_type. All fields are behavioural:
+No demographics — the dataset has no age, gender, or location fields. All signals are behavioural.
 
 ```python
 user_profile = {
     "customer_id":          str,     # e.g. "17850"
-    "purchase_history":     list,    # list of StockCode strings — [] for new users
-    "avg_order_value":      float,   # mean basket value in £
-    "total_invoices":       int,     # number of distinct orders
-    "recency_days":         int,     # days since last order (ref: 2011-12-09)
-    "price_range":          str,     # derived: "Low"|"Mid-Low"|"Mid-High"|"High"
-    "customer_segment":     str,     # derived: "New"|"Occasional"|"Frequent"
-    "favourite_category":   str,     # mode category across purchases — None if no history
-    "purchased_categories": list,    # all distinct categories ever bought — [] if no history
+    "purchase_history":     list,    # StockCode strings — [] for new users
+    "avg_order_value":      float,   # mean basket value in £ across all invoices
+    "total_invoices":       int,     # number of distinct orders placed
+    "recency_days":         int,     # days since last order (ref date: 2011-12-09)
+    "price_range":          str,     # "Low" | "Mid-Low" | "Mid-High" | "High"
+    "customer_segment":     str,     # "New" | "Occasional" | "Frequent"
+    "favourite_category":   str,     # most-purchased category — None if no history
+    "purchased_categories": list,    # all distinct categories bought — [] if no history
 }
 ```
 
----
-
-## Constants to Import
-
-```python
-from src.constants import (
-    PRODUCT_CATEGORIES,     # 8 category strings — your rules MUST return values from this list
-    SPEND_THRESHOLDS,       # £ quartile boundaries
-    PRICE_RANGES,           # ["Low", "Mid-Low", "Mid-High", "High"]
-    CUSTOMER_SEGMENTS,      # ["New", "Occasional", "Frequent"]
-    get_price_range,
-    get_customer_segment,
-)
-import pickle, os
-# For Rule 7:
-# category_sim = pickle.load(open('models/category_similarity.pkl','rb'))
-```
+`price_range` and `customer_segment` are already computed from the raw values — you do not need to derive them yourself. They come pre-calculated in the profile dict.
 
 ---
 
-## New PRODUCT_CATEGORIES (8 categories)
+## The 10 Rules
 
-```python
-PRODUCT_CATEGORIES = [
-    "Home Decor",           # default — dominant category in dataset
-    "Kitchen & Dining",
-    "Seasonal & Gifts",
-    "Toys & Games",
-    "Stationery & Craft",
-    "Fashion & Accessories",
-    "Garden & Outdoor",
-    "Food & Confectionery",
-]
-```
-
----
-
-## New SPEND_THRESHOLDS (£, from real data quartiles)
-
-```
-Low:      avg_order_value < £178.62      (bottom 25% of customers)
-Mid-Low:  £178.62 – £293.90
-Mid-High: £293.90 – £430.11
-High:     >= £430.11                     (top 25%)
-```
-
-Note: Values appear high because the dataset includes wholesale buyers placing bulk orders.
-The quartile split correctly reflects the actual customer distribution.
-
----
-
-## 10 Rules to Implement
-
-All rules are additive (add to eligible set). Rules 7 and 10 are restrictive (override or limit).
+Rules 1–4 gate by spend tier. Rules 5–10 refine by behaviour. Rules 7 and 10 are restrictive (they override or shrink the eligible set). All others are additive.
 
 ```python
 def apply_rules(user_profile: dict) -> list[str]:
     eligible = set()
 
-    # ── Primary rules: spend tier (Rules 1–4) ─────────────────────────────
+    # ── SPEND TIER RULES (1–4) ────────────────────────────────────────────────
     price_range = user_profile['price_range']
 
-    # RULE 1: Low spenders — affordable, broad-appeal categories
+    # Rule 1: Low spenders → affordable, high-volume categories
     if price_range == 'Low':
         eligible.update({'Home Decor', 'Stationery & Craft', 'Seasonal & Gifts'})
 
-    # RULE 2: Mid-Low spenders — mid-range categories
+    # Rule 2: Mid-Low spenders → mid-range categories
     if price_range == 'Mid-Low':
         eligible.update({'Home Decor', 'Kitchen & Dining',
                          'Seasonal & Gifts', 'Fashion & Accessories'})
 
-    # RULE 3: Mid-High spenders — higher-value categories
+    # Rule 3: Mid-High spenders → higher-value categories
     if price_range == 'Mid-High':
         eligible.update({'Kitchen & Dining', 'Home Decor',
                          'Toys & Games', 'Garden & Outdoor'})
 
-    # RULE 4: High spenders — full catalogue access
+    # Rule 4: High spenders → full catalogue
     if price_range == 'High':
         eligible.update(set(PRODUCT_CATEGORIES))
 
-    # ── Behavioural rules (Rules 5–10) ────────────────────────────────────
+    # ── BEHAVIOURAL RULES (5–10) ──────────────────────────────────────────────
 
-    # RULE 5: Favourite category always eligible (user's primary interest)
+    # Rule 5: Favourite category is always eligible
+    # Rationale: a customer's primary interest should never be excluded
     if user_profile.get('favourite_category'):
         eligible.add(user_profile['favourite_category'])
 
-    # RULE 6: Multi-category buyer (3+ categories) — broaden to full catalogue
+    # Rule 6: Broad buyer (3+ categories purchased) → full catalogue
+    # Rationale: customers who already explore widely should see everything
     if len(user_profile.get('purchased_categories', [])) >= 3:
         eligible.update(set(PRODUCT_CATEGORIES))
 
-    # RULE 7: Single-category buyer — focus on favourite + one most-similar neighbour
-    # Rationale: don't overwhelm a focused buyer; gently suggest one adjacent category
+    # Rule 7: Focused buyer (exactly 1 category ever purchased) → favourite + 1 neighbour
+    # Rationale: don't overwhelm someone who buys only one type of product;
+    # gently suggest the single most similar adjacent category using the ALS similarity matrix
     if len(user_profile.get('purchased_categories', [])) == 1:
         fav = user_profile['favourite_category']
-        eligible = {fav}   # reset to just favourite
+        eligible = {fav}
         try:
             import pickle
             cat_sim = pickle.load(open('models/category_similarity.pkl', 'rb'))
             neighbours = cat_sim[fav].drop(fav).sort_values(ascending=False)
-            adjacent = neighbours.index[0]
-            eligible.add(adjacent)
+            eligible.add(neighbours.index[0])
         except Exception:
-            eligible.update({'Home Decor', 'Seasonal & Gifts'})   # fallback
+            eligible.update({'Home Decor', 'Seasonal & Gifts'})  # fallback if pkl missing
 
-    # RULE 8: Dormant customer (90+ days since last order) — re-engagement categories
-    # Rationale: seasonal and food items drive impulse re-engagement
+    # Rule 8: Dormant customer (90+ days inactive) → re-engagement categories
+    # Rationale: seasonal and food items drive impulse re-engagement after a long absence
     if user_profile.get('recency_days', 0) > 90:
         eligible.update({'Seasonal & Gifts', 'Food & Confectionery'})
 
-    # RULE 9: Frequent buyer — full catalogue access
-    # Rationale: high-frequency buyers explore broadly
+    # Rule 9: Frequent buyer → full catalogue
+    # Rationale: high-frequency buyers explore broadly; no restrictions needed
     if user_profile.get('customer_segment') == 'Frequent':
         eligible.update(set(PRODUCT_CATEGORIES))
 
-    # RULE 10: New customer (no history) — restrict to most popular categories only
-    # Rationale: without purchase signal, only surface high-confidence categories
+    # Rule 10: New customer (no history) → most popular 3 categories only
+    # Rationale: without any purchase signal, only surface high-confidence categories.
+    # This OVERRIDES all previous rules — it replaces the eligible set, not adds to it.
     if user_profile.get('customer_segment') == 'New':
         eligible = {'Home Decor', 'Seasonal & Gifts', 'Kitchen & Dining'}
 
-    # ── Fallback ──────────────────────────────────────────────────────────
+    # ── FALLBACK ──────────────────────────────────────────────────────────────
+    # Should never trigger — but guarantees a non-empty return
     if not eligible:
         eligible = set(PRODUCT_CATEGORIES)
 
-    # Return in PRODUCT_CATEGORIES order (never arbitrary set order)
+    # Return in consistent PRODUCT_CATEGORIES order (never arbitrary set order)
     return [cat for cat in PRODUCT_CATEGORIES if cat in eligible]
 ```
 
@@ -194,29 +174,44 @@ def apply_rules(user_profile: dict) -> list[str]:
 
 ## Expected Outputs for SAMPLE_PROFILES
 
-| Profile | Segment | Price range | Key rules firing | Expected eligible |
+These are the 5 test profiles defined in `src/constants.py`. Run your function against all 5 and verify these outputs before pushing.
+
+| Profile | Segment | Spend | Rules firing | Expected eligible |
 |---|---|---|---|---|
 | `new_customer` | New | Low | Rule 10 overrides all | Home Decor, Seasonal & Gifts, Kitchen & Dining |
-| `gift_buyer` | Occasional | Low | Rules 1, 5 | Home Decor, Stationery & Craft, Seasonal & Gifts |
-| `craft_lover` | Occasional | Low | Rule 7 (single-cat buyer) | Stationery & Craft + 1 adjacent |
+| `gift_buyer` | Occasional | Low | Rules 1, 5, 8 | Home Decor, Stationery & Craft, Seasonal & Gifts, Food & Confectionery |
+| `craft_lover` | Occasional | Low | Rule 7 (single-cat buyer) | Stationery & Craft + 1 most-similar neighbour |
 | `home_decorator` | Frequent | Low | Rule 9 | All 8 categories |
 | `kitchen_enthusiast` | Frequent | Mid-Low | Rule 9 | All 8 categories |
 
 ---
 
+## Constants to Import
+
+```python
+from src.constants import (
+    PRODUCT_CATEGORIES,   # the 8 valid category strings — only return from this list
+    SPEND_THRESHOLDS,     # £ quartile boundaries (reference only — price_range is pre-computed)
+    PRICE_RANGES,         # ["Low", "Mid-Low", "Mid-High", "High"]
+    CUSTOMER_SEGMENTS,    # ["New", "Occasional", "Frequent"]
+)
+```
+
+Never hardcode category names, price values, or segment labels. Everything comes from constants.
+
+---
+
 ## What To Do
 
-1. Pull `src/constants.py` from `main` (already updated for the pivot)
-2. Create `src/rules_engine.py` and implement `apply_rules()` using the code above
-3. Test against all 5 `SAMPLE_PROFILES` from `constants.py` and verify expected outputs
-4. Document each rule with a comment explaining the real-world rationale
-5. Do NOT change the `apply_rules()` function signature
+1. Pull `main` to get the latest `src/constants.py`
+2. Create `src/rules_engine.py` with the `apply_rules()` function above
+3. Test against all 5 `SAMPLE_PROFILES` and verify expected outputs in the table above
+4. Add a comment to every rule explaining the real-world rationale (already included above)
+5. Create draft PR: `gh pr create --draft`
 
 ## Rules
 
-- Return values MUST be from `PRODUCT_CATEGORIES` — no other strings
+- Return values must all be from `PRODUCT_CATEGORIES` — never invent new strings
 - Return order must match `PRODUCT_CATEGORIES` list order
 - Never change `apply_rules()` signature — Member 4 calls it directly
-- All constants come from `src/constants.py` — never hardcode values
 - Do not push — user pushes manually
-- PRs must be draft: `gh pr create --draft`

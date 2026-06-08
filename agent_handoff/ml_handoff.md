@@ -6,121 +6,198 @@
 
 ---
 
-## Model Architecture (Session 3 Update)
+## What This Module Does
 
-Two models now power `predict_product()`. ALS is still used by `recommend_products()`.
+Member 3 owns the machine learning core of the recommendation system. This means two things:
 
-| Component | Model | Features | Trained on | Works for |
-|---|---|---|---|---|
-| `predict_product()` — Model A | RF (context) | segment, price_range, month (3) | All customers with test labels (~1,844) | ALL users incl. cold-start |
-| `predict_product()` — Model B | RF (history) | n_purchases, n_categories, recency, avg_value, fav_cat one-hot (15) | Returning customers only (~1,544) | Returning users |
-| `recommend_products()` | ALS item similarity | Binary user-item matrix | Full dataset | Returning users (popularity fallback for cold-start) |
+1. **Training** — running `notebooks/ml_model.ipynb` to produce trained model artefacts (`.pkl` files) that all other members load at inference time.
+2. **Inference functions** — `predict_product()` and `recommend_products()`, which are the two functions every other module depends on for personalised recommendations.
 
-**Confidence blend formula:**
-```
-confidence = 1 - 1 / (1 + n_purchases)
-
-n=0  → confidence=0.00 → 100% context model (cold-start)
-n=5  → confidence=0.83 → 17% context + 83% history
-n=10 → confidence=0.91 → 9% context + 91% history
-```
-
-Scores from `predict_product()` are **0–1 RF probabilities** (not cosine similarities).
-`predict_product()` no longer raises `ValueError` for empty `purchase_history`.
+Every recommendation the system produces either passes through `predict_product()` to rank categories, or through `recommend_products()` to pick specific products. Nothing in the system produces a final recommendation without calling one of these two functions.
 
 ---
 
-## Notebook Structure (10 sections)
+## How This Module Fits Into the Full Pipeline
 
-### Sections 1–5: Data pipeline (unchanged)
-Load → EDA → Clean → User-item matrix → Feature engineering (categories, customer features, product catalogue)
+The system has four components working in sequence. ML sits in the third position:
 
-### Section 6: Model Training (4 sub-sections)
-
-**6a. ALS** — same as before. Produces `item_sim_df` (3,665×3,665) and `category_sim_df` (8×8).
-
-**6b. Supervised training data construction**
-- Temporal split: `CUTOFF = 2011-11-01`
-- Recomputes customer stats from `df_train_sup` only (no leakage from test period)
-- Labels: for each customer with test-period purchases, 8 binary columns (did they buy from each category?)
-- Builds rows for both returning (~1,544) and cold-start (~300-400) customers
-- Combines into `df_train_ml` (one row per customer)
-- Encoding: `segment_map = {'New':0,'Occasional':1,'Frequent':2}`, `price_map = {'Low':0,...}`
-- `all_fav_cats = PRODUCT_CATEGORIES + ['Unknown']` (9 one-hot columns for favourite_category)
-
-**6c. Model A — Context model**
-```python
-from sklearn.multioutput import MultiOutputClassifier
-from sklearn.ensemble import RandomForestClassifier
-
-model_context = MultiOutputClassifier(
-    RandomForestClassifier(n_estimators=100, max_depth=8, class_weight='balanced', random_state=42)
-)
-model_context.fit(X_ctx, Y)   # X_ctx: (n, 3), Y: (n, 8) binary
-# len(model_context.estimators_) == 8 — one RF per category
+```
+User Profile
+     │
+     ▼
+Rules Engine (Member 2)
+  apply_rules(profile) → eligible: list of up to 8 categories
+     │
+     ▼
+Search Module (Member 1)
+  find_reachable_categories(profile, eligible) → shortlist: narrowed categories
+     │  (or for new users: find_popular_categories → bypass ML entirely)
+     ▼
+ML Module (Member 3)  ◄─── YOU ARE HERE
+  predict_product(profile, candidates=shortlist) → [(category, score), ...]
+  recommend_products(profile, category) → [{"category","product","price","score"}, ...]
+     │
+     ▼
+Integration (Member 4)
+  recommend(profile) → final output dict
 ```
 
-**6d. Model B — History model**
-```python
-model_history = MultiOutputClassifier(
-    RandomForestClassifier(n_estimators=100, max_depth=8, class_weight='balanced', random_state=42)
-)
-model_history.fit(X_hist, Y_hist)   # X_hist: (n_returning, 15), Y_hist: (n_returning, 8)
-```
-
-### Section 7: Evaluation (2 parts)
-
-**7a. Category HR@3** — primary evaluation for `predict_product()`
-- For ~1,544 returning customers: did top-3 predicted categories include any actually-bought category?
-- Compares: RF blend vs old CF-based scoring vs popularity
-- Also demonstrates cold-start working (no ValueError for `new_customer` profile)
-
-**7b. Product HR@K** — secondary evaluation for `recommend_products()`
-- Same temporal split, compares ALS vs Raw Cosine vs Popularity at item level
-
-### Sections 8–10: Save → Inference functions → Demo
+**Key point:** The ML module never sees the raw transaction data at inference time. It only sees the user profile dict and the shortlist from the search module. All the heavy computation is done once at training time and stored in pkl files.
 
 ---
 
-## Saved Artefacts (8 files)
+## Architecture of the ML Module
 
-| File | Contents | Role |
+Two completely separate model types serve two separate purposes:
+
+### Model 1 — ALS (Alternating Least Squares)
+**Purpose:** Score specific *products* within a category  
+**Used by:** `recommend_products()`  
+**How it works:**
+- Trained on the full user-item binary matrix (4,338 customers × 3,665 products)
+- ALS compresses this into 50-dimensional "factor" vectors for every product
+- Two products with similar factor vectors are likely bought by the same type of customer
+- At inference, a customer's owned items are used as seed — products most similar to those seeds get recommended
+- Falls back to global popularity ranking if the customer has no purchase history
+
+### Model 2 — Random Forest Blend (Models A + B)
+**Purpose:** Score *categories* — predict which product types a customer will buy next  
+**Used by:** `predict_product()`  
+**How it works:**
+- **Model A (Context):** 3 features — customer segment, price range, current month. Works for *all* users including brand new ones with no history.
+- **Model B (History):** 15 features — purchase count, recency, spend, favourite category. Only meaningful for returning users.
+- Both models output a probability (0–1) that the customer will buy from each of the 8 categories
+- The outputs are blended by purchase confidence: `confidence = 1 - 1/(1 + n_purchases)`
+  - New user (0 purchases) → 100% Model A
+  - 5 purchases → 83% Model B, 17% Model A
+  - 10+ purchases → ~91% Model B, ~9% Model A
+
+---
+
+## Training Data Construction
+
+The RF models are trained on supervised examples built from the temporal split:
+
+- **Features** come from each customer's transaction history **before November 2011**
+- **Labels** are which categories they actually bought from in **November–December 2011**
+
+This is called a temporal split. It mirrors real deployment: the model learns from the past and is judged on the future.
+
+A customer-level 80/20 split is applied:
+- **80% of returning customers** → training set for the RF models
+- **20% of returning customers** → held out for honest evaluation
+- **All cold-start customers** → training set (they have no pre-November history to evaluate against)
+
+The ALS model is trained on the **full dataset** (no split needed — it learns purchase patterns, not future predictions).
+
+---
+
+## Evaluation Strategy
+
+Three evaluation steps, each measuring something different:
+
+| Section | What it measures | Data used |
 |---|---|---|
-| `models/als_model.pkl` | Trained ALS model | Used internally for item factors |
-| `models/similarity_matrix.pkl` | 3,665×3,665 item cosine similarity | `recommend_products()` |
-| `models/category_similarity.pkl` | 8×8 category similarity DataFrame | Member 1 BFS search |
-| `models/model_context.pkl` | MultiOutputClassifier(RF), 3 features | `predict_product()` Model A |
-| `models/model_history.pkl` | MultiOutputClassifier(RF), 15 features | `predict_product()` Model B |
-| `models/product_catalogue.pkl` | StockCode, Description, category, popularity_rank, avg_price | Both functions |
-| `models/customer_features.pkl` | Per-customer aggregated features | Reference |
-| `models/encoder_category.pkl` | LabelEncoder for PRODUCT_CATEGORIES | Reference |
+| 6e: Classification report | Are the RF classifiers accurate? | 20% held-out customers |
+| 7a: Category HR@3 | Does the top-3 category list include something correct? | 20% held-out customers |
+| 7b: Product HR@K | Does the top-K product list include something the customer actually bought? | 20% held-out customers |
 
-All pkl files are gitignored — regenerate by running `Kernel → Restart & Run All`.
+**HR@K (Hit Rate@K):** For each customer, the system recommends K items. If at least one is something the customer actually bought, that's a hit. HR@K is the fraction of customers who got at least one hit.
 
 ---
 
-## Public Interface (signatures unchanged)
+## Saved Artefacts (8 pkl files)
+
+All saved to `models/` directory. All gitignored — regenerate by running `Kernel → Restart & Run All`.
+
+| File | Size | Used by | Contents |
+|---|---|---|---|
+| `als_model.pkl` | ~1.6 MB | Internal | Trained ALS model object |
+| `similarity_matrix.pkl` | ~54 MB | `recommend_products()` | 3,665 × 3,665 item cosine similarity (float32) |
+| `category_similarity.pkl` | <1 MB | Member 1 search module | 8 × 8 category cosine similarity DataFrame |
+| `model_context.pkl` | <1 MB | `predict_product()` | MultiOutputClassifier RF, 3 features |
+| `model_history.pkl` | <1 MB | `predict_product()` | MultiOutputClassifier RF, 15 features |
+| `product_catalogue.pkl` | ~1 MB | Both functions | StockCode, Description, category, avg_price, popularity_rank |
+| `customer_features.pkl` | ~1 MB | Reference | Per-customer aggregated features |
+| `encoder_category.pkl` | <1 MB | Reference | LabelEncoder for PRODUCT_CATEGORIES |
+
+---
+
+## Public Interface
+
+### `predict_product(user_profile, candidates=None)`
+
+Scores candidate categories for a user. Works for all users including cold-start.
 
 ```python
-# Works for ALL users including cold-start (no longer raises ValueError)
 predict_product(user_profile: dict, candidates: list = None) -> list[tuple[str, float]]
-# Returns: [("Home Decor", 0.312), ("Kitchen & Dining", 0.287), ...] — probabilities 0-1
-
-# Personalized product scoring within a category (ALS). Falls back to popularity for cold-start.
-recommend_products(user_profile: dict, category: str, top_n: int = 3) -> list[dict]
-# Returns: [{"category": str, "product": str, "score": float}, ...]
 ```
 
-Key change from previous session: `predict_product()` scores are now **0–1 probabilities**
-from the RF models, not cosine similarities (previously ~0.02–0.15). Member 4's `recommend()`
-just sorts by score, so it's unaffected.
+- `candidates`: optional subset of `PRODUCT_CATEGORIES` (passed by search module). Defaults to all 8.
+- Returns `[(category, score), ...]` sorted by score descending. Scores are RF probabilities (0–1).
+- **Never raises ValueError** — cold-start users get context model scores.
+
+### `recommend_products(user_profile, category, top_n=3)`
+
+Recommends specific products within one category using ALS item similarity.
+
+```python
+recommend_products(user_profile: dict, category: str, top_n: int = 3) -> list[dict]
+```
+
+- Returns `[{"category": str, "product": str, "price": float, "score": float}, ...]`
+- `price` is the average unit price in £, rounded to 2 decimal places
+- `score` is cosine similarity (0–1) for returning users, or `0.0` for popularity fallback
+- Never returns products the user already owns (filters `purchase_history`)
+
+---
+
+## Notebook Structure (10 Sections)
+
+| Section | What happens |
+|---|---|
+| 1. Load Data | Read Online Retail.xlsx (397,884 rows) |
+| 2. EDA | Explore distributions, missing values, cancellations |
+| 3. Data Cleaning | Remove guest checkouts, cancellations, zero-price rows |
+| 4. Preprocessing | Build binary user-item matrix (4,338 × 3,665) |
+| 5. Feature Engineering | Category mapping via keywords, customer features, product catalogue |
+| 6a. ALS | Train ALS, build item similarity matrix and category similarity matrix |
+| 6b. Training Data | Temporal split, build supervised training rows |
+| 6b (Train/Test Split) | Split customers 80/20 |
+| 6c. Model A | Train context RF on 80% training customers |
+| 6d. Model B | Train history RF on 80% returning customers |
+| 6e. Evaluation | Classification report + confusion matrices on 20% held-out |
+| 6f. Feature Importance | Charts showing which features drive each model |
+| 7. Recommendation Evaluation | Category HR@3 and Product HR@K on 20% held-out |
+| 8. Save Artefacts | Save 8 pkl files to models/ |
+| 9. Inference Functions | Reload artefacts, define predict_product and recommend_products |
+| 10. Demo + Trace | Run all 5 SAMPLE_PROFILES, step-by-step pipeline trace |
+
+---
+
+## Current Status
+
+- `notebooks/ml_model.ipynb` — **fully written, NOT YET EXECUTED**
+- Run `Kernel → Restart & Run All` to generate the pkl artefacts
+- `src/constants.py` — complete and correct
+- `models/` — empty until notebook is run
+
+### Immediate Next Step
+
+Run the notebook. After execution verify:
+1. All 8 pkl files exist in `models/`
+2. Section 6e classification report prints without error
+3. Section 7b product HR@K completes (uses fast numpy, should be ~30–60 seconds)
+4. Section 10 demo shows 3 categories × 3 products × 5 profiles = 45 product recommendations with prices
+5. `new_customer` profile produces `recommendation_type = "popular"` (no ValueError)
 
 ---
 
 ## Rules
 
-- `predict_product()` and `recommend_products()` signatures are fixed — Member 4 calls them
-- `recommend_products()` returns a flat list of dicts with keys: category, product, score
-- Never return items that appear in `purchase_history`
+- `predict_product()` and `recommend_products()` signatures are frozen — Member 4 calls them
+- Both functions must return values from `PRODUCT_CATEGORIES` only
+- Never return items in `purchase_history`
+- All constants import from `src/constants.py`
 - Do not push — user pushes manually
-- To rebuild notebook: `python scripts/build_notebook.py` then execute
+- PRs must be draft: `gh pr create --draft`
