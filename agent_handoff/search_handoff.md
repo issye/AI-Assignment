@@ -215,6 +215,20 @@ find_popular_categories(
 
 ---
 
+## Session 3 Note (ML update)
+
+`predict_product()` now works for cold-start users too — it returns RF probability scores
+for ALL users including those with empty `purchase_history`. However, your
+`find_popular_categories()` is still needed because:
+1. The integration notebook (`recommend()`) still routes cold-start users through the popular
+   path for `recommendation_type = "popular"` (which uses integer buyer counts, not probabilities)
+2. `recommend_products()` falls back to `popularity_rank` for cold-start product selection,
+   which depends on the data your function surfaces
+
+No changes needed to your function signatures or implementation.
+
+---
+
 ## What To Do
 
 1. Pull `src/constants.py` and `models/*.pkl` from `main` (artefacts saved by Member 3)
