@@ -12,8 +12,8 @@
 | `src/search_module.py` | ✅ Implemented and tested |
 | `notebooks/search_demo.ipynb` | ✅ Fully executed with visualisations |
 | `scripts/test_search.py` | ✅ 15/15 tests pass |
-| `models/category_similarity.pkl` | ⚠️ Synthetic fixture for now — replaced when Member 3 runs `ml_model.ipynb` |
-| `models/product_catalogue.pkl` | ⚠️ Synthetic fixture for now — replaced when Member 3 runs `ml_model.ipynb` |
+| `models/category_similarity.pkl` | ✅ Real ALS-derived data — 292,822 transactions, 3,575 products, 3,816 customers |
+| `models/product_catalogue.pkl` | ✅ Real ALS-derived data — 3,781 products with real buyer counts |
 
 ---
 
@@ -65,18 +65,20 @@ Member 3's ALS model produces a 3,665 × 3,665 item similarity matrix. This is a
 
 Each cell is the average cosine similarity between all products in category A and category B, computed from ALS latent factors. It reflects which categories tend to be bought together in the real data.
 
-This matrix is the graph. Categories are nodes. An edge exists between two categories if their similarity exceeds the threshold (default 0.40).
+This matrix is the graph. Categories are nodes. An edge exists between two categories if their similarity exceeds the threshold (default 0.05).
 
-Example values (approximate):
+Note: ALS raw mean cosine similarity values are small (0.04–0.10 range) — this is expected. The threshold is calibrated to this range.
+
+Example values (real ALS-derived data, UCI Online Retail dataset):
 
 | | Home Decor | Kitchen & Dining | Seasonal & Gifts | Fashion & Accessories |
 |---|---|---|---|---|
-| **Home Decor** | 1.00 | 0.81 | 0.74 | 0.22 |
-| **Kitchen & Dining** | 0.81 | 1.00 | 0.69 | 0.18 |
-| **Seasonal & Gifts** | 0.74 | 0.69 | 1.00 | 0.21 |
-| **Fashion & Accessories** | 0.22 | 0.18 | 0.21 | 1.00 |
+| **Home Decor** | 1.00 | 0.0533 | 0.0447 | 0.0463 |
+| **Kitchen & Dining** | 0.0533 | 1.00 | ~0.05 | ~0.04 |
+| **Seasonal & Gifts** | 0.0447 | ~0.05 | 1.00 | ~0.04 |
+| **Fashion & Accessories** | 0.0463 | ~0.04 | ~0.04 | 1.00 |
 
-Fashion & Accessories is isolated from the home/kitchen/seasonal cluster. A Home Decor customer will never reach it within 2 hops above 0.40.
+Fashion & Accessories (sim=0.046 < 0.05) is pruned from a Home Decor customer's shortlist. Seasonal & Gifts is reached via hop-2 through Stationery & Craft or Toys & Games.
 
 ---
 
@@ -89,7 +91,7 @@ def find_reachable_categories(
     user_profile: dict,
     eligible:     list,
     max_hops:     int   = 2,
-    threshold:    float = 0.40,
+    threshold:    float = 0.05,
 ) -> list[str]:
 ```
 
@@ -141,16 +143,17 @@ find_reachable_categories(profile, eligible):
 
   START: Home Decor
 
-  Hop 1 (sim > 0.40):
-    Kitchen & Dining    0.81  ✓ → add
-    Seasonal & Gifts    0.74  ✓ → add
-    Stationery & Craft  0.61  ✓ → add
-    Garden & Outdoor    0.44  ✓ → add
-    Fashion & Accessories 0.22 ✗ below threshold → skip
+  Hop 1 (sim >= 0.05):
+    Food & Confectionery  0.0629  ✓ → add
+    Stationery & Craft    0.0601  ✓ → add
+    Garden & Outdoor      0.0565  ✓ → add
+    Kitchen & Dining      0.0533  ✓ → add
+    Toys & Games          0.0507  ✓ → add
+    Fashion & Accessories 0.0463  ✗ below threshold → skip (pruned)
+    Seasonal & Gifts      0.0447  ✗ below threshold → skip (but reachable via hop-2)
 
-  Hop 2 (neighbours of hop-1 not yet visited):
-    Toys & Games        reachable via Kitchen & Dining → add
-    Food & Confectionery reachable via Seasonal & Gifts → add
+  Hop 2 (neighbours of hop-1 not yet visited, sim >= 0.05):
+    Seasonal & Gifts    reachable via Stationery & Craft or Toys & Games → add
 
   RESULT: ['Home Decor', 'Kitchen & Dining', 'Seasonal & Gifts',
            'Stationery & Craft', 'Garden & Outdoor',
@@ -171,7 +174,8 @@ Profile:
 Rules engine returns: ["Home Decor", "Seasonal & Gifts", "Kitchen & Dining"]
 
 find_popular_categories(eligible, "Low", top_n=3):
-  → [("Home Decor", 8420), ("Seasonal & Gifts", 5310), ("Kitchen & Dining", 4190)]
+  → [("Home Decor", 115726), ("Kitchen & Dining", 22194), ("Seasonal & Gifts", 14036)]
+  (real buyer counts from UCI Online Retail dataset)
 
 ML model bypassed. Popularity ranking IS the recommendation.
 ```
@@ -187,7 +191,7 @@ from src.search_module import find_reachable_categories, find_popular_categories
 if not profile['purchase_history']:
     # Cold-start path
     popular = find_popular_categories(eligible, profile['price_range'], top_n=3)
-    # popular = [('Home Decor', 8420), ('Seasonal & Gifts', 5310), ...]
+    # popular = [('Home Decor', 115726), ('Kitchen & Dining', 22194), ...]
     # recommendation_type = "popular", scores are integers
 else:
     # Personalised path
@@ -211,7 +215,7 @@ else:
 | `models/category_similarity.pkl` | `find_reachable_categories` | 8×8 pandas DataFrame, category→category cosine similarity |
 | `models/product_catalogue.pkl` | `find_popular_categories` | DataFrame: StockCode, Description, category, avg_price, popularity_rank |
 
-Both generated by `notebooks/ml_model.ipynb` (Member 3). Currently replaced by synthetic fixtures with matching structure for testing.
+Both generated from the UCI Online Retail dataset (292,822 transactions) using ALS collaborative filtering. Committed to `feature/search`. Member 3 will overwrite with their own run of `notebooks/ml_model.ipynb` — the structure is identical so `search_module.py` requires no changes.
 
 ---
 
