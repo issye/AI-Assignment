@@ -11,10 +11,10 @@ An intelligent Career Recommendation System that combines rule-based reasoning, 
 
 | Student ID | Name | Branch | Module |
 |---|---|---|---|
-| | (Team Lead — Issye) | `feature/search` | Search Algorithm (A\*) + GitHub |
-| | Member 2 | `feature/rules` | Knowledge Representation & Logic |
-| | Member 3 | `feature/ml` | Machine Learning Model |
-| | Member 4 | `feature/integration` | Integration & System Design + Poster |
+| | Issye Lailiyah| `feature/search` | Search Algorithm (A\*) + GitHub |
+| | Thinesh | `feature/rules` | Knowledge Representation & Logic |
+| | Wan Arief | `feature/ml` | Machine Learning Model |
+| | Adam Hadziq | `feature/integration` | Integration & System Design + Poster |
 
 ---
 
