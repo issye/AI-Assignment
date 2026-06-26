@@ -33,21 +33,21 @@ def apply_rules(user_profile: dict) -> list[str]:
     # SPEND TIER RULES (1–4) 
     # Limits risk exposure by presenting budget-appropriate inventories.
     
-    # Rule 1: Low spenders → affordable, high-volume categories
+    # Rule 1: Low spenders leads to affordable, high-volume categories
     if price_range == 'Low':
         eligible.update({'Home Decor', 'Stationery & Craft', 'Seasonal & Gifts'})
 
-    # Rule 2: Mid-Low spenders → mid-range consumer categories
+    # Rule 2: Mid-Low spenders leads to mid-range consumer categories
     elif price_range == 'Mid-Low':
         eligible.update({'Home Decor', 'Kitchen & Dining', 
                          'Seasonal & Gifts', 'Fashion & Accessories'})
 
-    # Rule 3: Mid-High spenders → higher-value discretionary categories
+    # Rule 3: Mid-High spenders leads to higher-value discretionary categories
     elif price_range == 'Mid-High':
         eligible.update({'Kitchen & Dining', 'Home Decor', 
                          'Toys & Games', 'Garden & Outdoor'})
 
-    # Rule 4: High spenders → unlock complete multi-tier inventory portfolio
+    # Rule 4: High spenders leads to unlock complete multi-tier inventory portfolio
     elif price_range == 'High':
         eligible.update(set(PRODUCT_CATEGORIES))
 
@@ -67,8 +67,8 @@ def apply_rules(user_profile: dict) -> list[str]:
         eligible.update(set(PRODUCT_CATEGORIES))
 
     # Rule 7: Defensive focused customer specialization containment
-    # Rationale: Avoid choice paralysis for narrow shoppers; introduce exactly one 
-    # highly co-purchased neighboring category computed via Alternating Least Squares (ALS).
+    # Rationale: Avoid choice paralysis for narrow shoppers by introducing exactly one 
+    # highly co-purchased neighboring category computed using Alternating Least Squares (ALS).
     if len(purchased_cats) == 1:
         fav = user_profile.get('favourite_category')
         if fav:
@@ -81,7 +81,7 @@ def apply_rules(user_profile: dict) -> list[str]:
                 eligible.add(neighbours.index[0])
             except Exception as e:
                 logger.warning(f"Category similarity model failure ({e}). Deploying static fail-safes.")
-                eligible.update({'Home Decor', 'Seasonal & Gifts'})  # Academic fallback spec
+                eligible.update({'Home Decor', 'Seasonal & Gifts'})  
 
     # Rule 8: Inactivity churn countermeasure & re-engagement
     # Rationale: High-margin impulse items like seasonal and food gifts drive re-activation hooks.
@@ -89,7 +89,7 @@ def apply_rules(user_profile: dict) -> list[str]:
         eligible.update({'Seasonal & Gifts', 'Food & Confectionery'})
 
     # Rule 9: Power shopper maximum discovery expansion
-    # Rationale: High-frequency buyers maintain complex search habits; suppress filters completely.
+    # Rationale: High-frequency buyers maintain complex search habits which suppress filters completely.
     if user_profile.get('customer_segment') == 'Frequent':
         eligible.update(set(PRODUCT_CATEGORIES))
 
@@ -99,7 +99,7 @@ def apply_rules(user_profile: dict) -> list[str]:
     if user_profile.get('customer_segment') == 'New':
         eligible = {'Home Decor', 'Seasonal & Gifts', 'Kitchen & Dining'}
 
-    # STRUCTURAL PIPELINE PROTECTIONS 
+    # Structural pipeline protection
     # Safeguard downstream pipeline architectures against empty candidate sets.
     if not eligible:
         eligible = set(PRODUCT_CATEGORIES)
